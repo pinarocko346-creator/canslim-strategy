@@ -32,8 +32,25 @@ import numpy as np
 import json
 import argparse
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
+
+
+def convert_to_serializable(obj: Any) -> Any:
+    """Convert numpy types to Python native types for JSON serialization"""
+    if isinstance(obj, dict):
+        return {k: convert_to_serializable(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_to_serializable(v) for v in obj]
+    elif isinstance(obj, (np.bool_, np.bool)):
+        return bool(obj)
+    elif isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    elif isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    elif isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
 
 # 默认观察列表 - 优质成长股
 DEFAULT_WATCHLIST = [
@@ -409,7 +426,7 @@ def print_detailed_analysis(results: List[CANSLIMScore], top_n: int = 5) -> None
 
 def export_to_json(results: List[CANSLIMScore], filepath: str) -> None:
     """导出结果为JSON"""
-    data = [asdict(r) for r in results]
+    data = [convert_to_serializable(asdict(r)) for r in results]
     with open(filepath, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
     print(f"\n✅ 结果已导出: {filepath}")
@@ -480,7 +497,8 @@ def main():
     
     # 输出
     if args.output == 'json':
-        print(json.dumps([asdict(r) for r in results[:args.top]], ensure_ascii=False, indent=2))
+        data = [convert_to_serializable(asdict(r)) for r in results[:args.top]]
+        print(json.dumps(data, ensure_ascii=False, indent=2))
     else:
         print_results_table(results, args.top)
         print_detailed_analysis(results, min(5, args.top))
