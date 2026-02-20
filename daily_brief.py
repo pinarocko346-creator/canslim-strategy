@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.10"
+# dependencies = [
+#     "yfinance>=0.2.40",
+# ]
+# ///
+
 """
 Daily Briefing Bot - 每日简报发送脚本
 独立运行，不依赖 agent，直接推送 Discord
@@ -42,9 +49,57 @@ def get_weather() -> str:
     return stdout if stdout else "☀️ +20°C"
 
 
-def get_spy_trend() -> str:
-    """获取 SPY 市场趋势（简化版，直接解析 scanner 输出）"""
-    return "⚠️ 震荡/下降"
+def get_market_trend() -> dict:
+    """获取 SPY 和 QQQ 市场趋势"""
+    try:
+        import yfinance as yf
+        
+        def get_trend(ticker):
+            try:
+                t = yf.Ticker(ticker)
+                hist = t.history(period="3mo")
+                if len(hist) < 50:
+                    return None
+                price = hist['Close'].iloc[-1]
+                sma50 = hist['Close'].rolling(50).mean().iloc[-1]
+                diff = (price - sma50) / sma50 * 100
+                
+                # 判断趋势
+                if diff > 1:
+                    trend = "📈 上升"
+                elif diff < -1:
+                    trend = "📉 下降"
+                else:
+                    trend = "⚠️ 震荡"
+                
+                return {"trend": trend, "diff": diff, "price": price}
+            except Exception as e:
+                print(f"Error getting {ticker}: {e}", file=sys.stderr)
+                return None
+        
+        spy = get_trend("SPY")
+        qqq = get_trend("QQQ")
+        
+        result = []
+        if spy:
+            result.append(f"SPY {spy['trend']} ({spy['diff']:+.1f}%)")
+        if qqq:
+            result.append(f"QQQ {qqq['trend']} ({qqq['diff']:+.1f}%)")
+        
+        raw = " | ".join(result) if result else "SPY/QQQ: 数据获取失败"
+        
+        return {
+            "spy": f"SPY {spy['trend']}" if spy else "⚠️ 震荡",
+            "qqq": f"QQQ {qqq['trend']}" if qqq else "⚠️ 震荡",
+            "raw": raw
+        }
+    except Exception as e:
+        print(f"Market trend error: {e}", file=sys.stderr)
+        return {
+            "spy": "⚠️ 震荡",
+            "qqq": "⚠️ 震荡",
+            "raw": "SPY: 数据获取失败 | QQQ: 数据获取失败"
+        }
 
 
 def get_canslim_stocks() -> list:
@@ -93,13 +148,13 @@ def build_message() -> str:
     """构建完整简报消息"""
     today = datetime.now().strftime("%m-%d")
     weather = get_weather()
+    market = get_market_trend()
     stocks = get_canslim_stocks()
     
     lines = [
         f"🌅 简报 | {today}",
         f"🌤️ 上海: {weather}",
-        "📈 SPY: 震荡/下降 (-0.4% vs 50日MA)",
-        "⚠️ 市场趋势: 谨慎操作",
+        f"📈 {market['raw']}",
         ""
     ]
     
