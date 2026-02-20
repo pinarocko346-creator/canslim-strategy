@@ -6,6 +6,7 @@
 #     "pandas>=2.0.0",
 #     "numpy>=1.24.0",
 #     "matplotlib>=3.7.0",
+#     "requests>=2.31.0",
 # ]
 # ///
 
@@ -45,6 +46,114 @@ try:
     AKSHARE_AVAILABLE = True
 except ImportError:
     AKSHARE_AVAILABLE = False
+
+# Alpha Vantage 数据支持 (美股技术指标/基本面)
+import os
+import time
+import requests
+from datetime import datetime, timedelta
+
+ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
+ALPHAVANTAGE_AVAILABLE = bool(ALPHA_VANTAGE_API_KEY)
+
+# Alpha Vantage 缓存
+_av_cache = {}
+_av_cache_time = {}
+_av_last_request = 0
+MIN_AV_INTERVAL = 12  # 免费版 5次/分钟
+
+def _av_rate_limit():
+    """Alpha Vantage 限流"""
+    global _av_last_request
+    elapsed = time.time() - _av_last_request
+    if elapsed < MIN_AV_INTERVAL:
+        time.sleep(MIN_AV_INTERVAL - elapsed)
+    _av_last_request = time.time()
+
+def _av_get_cache(key: str):
+    if key in _av_cache and key in _av_cache_time:
+        if time.time() - _av_cache_time[key] < 300:  # 5分钟缓存
+            return _av_cache[key]
+    return None
+
+def _av_set_cache(key: str, data):
+    _av_cache[key] = data
+    _av_cache_time[key] = time.time()
+
+def get_av_quote(symbol: str) -> Optional[Dict]:
+    """Alpha Vantage 实时报价"""
+    if not ALPHAVANTAGE_AVAILABLE:
+        return None
+    
+    cache_key = f"av_quote_{symbol}"
+    cached = _av_get_cache(cache_key)
+    if cached:
+        return cached
+    
+    _av_rate_limit()
+    
+    try:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": symbol,
+            "apikey": ALPHA_VANTAGE_API_KEY
+        }
+        response = requests.get(url, params=params, timeout=30)
+        data = response.json()
+        
+        if "Global Quote" in data and data["Global Quote"]:
+            quote = data["Global Quote"]
+            result = {
+                "price": float(quote.get("05. price", 0)),
+                "change": float(quote.get("09. change", 0)),
+                "change_percent": quote.get("10. change percent", "0%"),
+                "volume": int(quote.get("06. volume", 0)),
+            }
+            _av_set_cache(cache_key, result)
+            return result
+    except:
+        pass
+    return None
+
+def get_av_fundamentals(symbol: str) -> Optional[Dict]:
+    """Alpha Vantage 基本面数据"""
+    if not ALPHAVANTAGE_AVAILABLE:
+        return None
+    
+    cache_key = f"av_fund_{symbol}"
+    cached = _av_get_cache(cache_key)
+    if cached:
+        return cached
+    
+    _av_rate_limit()
+    
+    try:
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "OVERVIEW",
+            "symbol": symbol,
+            "apikey": ALPHA_VANTAGE_API_KEY
+        }
+        response = requests.get(url, params=params, timeout=30)
+        data = response.json()
+        
+        if data and "Symbol" in data:
+            result = {
+                "sector": data.get("Sector", ""),
+                "industry": data.get("Industry", ""),
+                "market_cap": int(data.get("MarketCapitalization", 0)),
+                "pe_ratio": float(data.get("PERatio", 0)) if data.get("PERatio") else None,
+                "pb_ratio": float(data.get("PriceToBookRatio", 0)) if data.get("PriceToBookRatio") else None,
+                "roe": float(data.get("ReturnOnEquityTTM", 0)) * 100 if data.get("ReturnOnEquityTTM") else None,
+                "revenue_growth": float(data.get("QuarterlyRevenueGrowthYOY", 0)) * 100 if data.get("QuarterlyRevenueGrowthYOY") else None,
+                "earnings_growth": float(data.get("QuarterlyEarningsGrowthYOY", 0)) * 100 if data.get("QuarterlyEarningsGrowthYOY") else None,
+            }
+            _av_set_cache(cache_key, result)
+            return result
+    except:
+        pass
+    return None
 
 
 def convert_to_serializable(obj: Any) -> Any:
@@ -238,7 +347,7 @@ def get_cn_stock_data(code: str) -> Tuple[Optional[Dict], Optional[pd.DataFrame]
         return None, None
 
 
-def analyze_c_current(stock: yf.Ticker, score: CANSLIMScore) -> None:
+def analyze_c_current(stock: yf.Ticker, score: CANSLIMScore, ticker: str = "") -> None:
     """分析C - Current Quarterly Earnings/Revenue"""
     try:
         # 尝试获取季度收入数据
@@ -274,9 +383,28 @@ def analyze_c_current(stock: yf.Ticker, score: CANSLIMScore) -> None:
                         score.c_earnings_growth = round(growth, 2)
     except:
         pass
+    
+    # 使用 Alpha Vantage 补充数据
+    if ticker and ALPHAVANTAGE_AVAILABLE:
+        av_fund = get_av_fundamentals(ticker)
+        if av_fund:
+            # Alpha Vantage 提供季度增长数据
+            if not score.c_revenue_growth and av_fund.get('revenue_growth'):
+                score.c_revenue_growth = av_fund['revenue_growth']
+                if score.c_revenue_growth > 25:
+                    score.c_score = max(score.c_score, 25)
+                    if "C+" not in score.passed_criteria:
+                        score.passed_criteria.append("C+")
+                elif score.c_revenue_growth > 15:
+                    score.c_score = max(score.c_score, 15)
+                    if "C" not in score.passed_criteria and "C+" not in score.passed_criteria:
+                        score.passed_criteria.append("C")
+            
+            if not score.c_earnings_growth and av_fund.get('earnings_growth'):
+                score.c_earnings_growth = av_fund['earnings_growth']
 
 
-def analyze_a_annual(stock: yf.Ticker, score: CANSLIMScore) -> None:
+def analyze_a_annual(stock: yf.Ticker, score: CANSLIMScore, ticker: str = "") -> None:
     """分析A - Annual Earnings Growth"""
     try:
         info = stock.info
@@ -295,6 +423,18 @@ def analyze_a_annual(stock: yf.Ticker, score: CANSLIMScore) -> None:
             score.a_annual_growth = round(annual_revenue * 100, 2)
     except:
         pass
+    
+    # 使用 Alpha Vantage 补充数据
+    if ticker and ALPHAVANTAGE_AVAILABLE:
+        av_fund = get_av_fundamentals(ticker)
+        if av_fund:
+            # Alpha Vantage 的 ROE 更精确
+            if not score.a_roe and av_fund.get('roe'):
+                score.a_roe = av_fund['roe']
+                if score.a_roe > 17:
+                    score.a_score = 15
+                    if "A" not in score.passed_criteria:
+                        score.passed_criteria.append("A")
 
 
 def analyze_n_new_highs(hist: pd.DataFrame, score: CANSLIMScore) -> None:
@@ -400,8 +540,8 @@ def analyze_stock(ticker: str) -> Optional[CANSLIMScore]:
         score.market_cap = info.get('marketCap', 0)
 
         # 逐项分析
-        analyze_c_current(stock, score)
-        analyze_a_annual(stock, score)
+        analyze_c_current(stock, score, ticker)
+        analyze_a_annual(stock, score, ticker)
         analyze_n_new_highs(hist, score)
         analyze_s_supply_demand(hist, score)
         analyze_l_leader(hist, score)
@@ -620,8 +760,10 @@ def main():
         market_name = "美股"
 
     print("=" * 90)
-    print(f"🦐 CAN SLIM 成长股量化筛选器 v1.1 - {market_name}")
+    print(f"🦐 CAN SLIM 成长股量化筛选器 v1.2 - {market_name}")
     print("   基于威廉·欧奈尔(William J. O'Neil)投资策略")
+    if ALPHAVANTAGE_AVAILABLE and args.market != 'cn':
+        print("   📊 Alpha Vantage 数据增强已启用")
     print("=" * 90)
 
     # 检查市场方向
