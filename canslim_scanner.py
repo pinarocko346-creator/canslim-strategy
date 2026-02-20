@@ -2,6 +2,7 @@
 # requires-python = ">=3.10"
 # dependencies = [
 #     "yfinance>=0.2.40",
+#     "akshare>=1.15.0",
 #     "pandas>=2.0.0",
 #     "numpy>=1.24.0",
 #     "matplotlib>=3.7.0",
@@ -21,9 +22,12 @@ I = Institutional Sponsorship (机构持仓)
 M = Market Direction (市场趋势)
 
 Usage:
-    uv run canslim_scanner.py
+    uv run canslim_scanner.py                    # 分析美股 (默认)
+    uv run canslim_scanner.py --market cn        # 分析A股
+    uv run canslim_scanner.py --market all       # 分析美股+A股
     uv run canslim_scanner.py --top 10 --min-score 40
     uv run canslim_scanner.py --watchlist AAPL MSFT NVDA --output json
+    uv run canslim_scanner.py --market cn --watchlist 600519 000858 300750
 """
 
 import yfinance as yf
@@ -34,6 +38,13 @@ import argparse
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
+
+# A股数据支持 (akshare)
+try:
+    import akshare as ak
+    AKSHARE_AVAILABLE = True
+except ImportError:
+    AKSHARE_AVAILABLE = False
 
 
 def convert_to_serializable(obj: Any) -> Any:
@@ -52,8 +63,8 @@ def convert_to_serializable(obj: Any) -> Any:
         return obj.tolist()
     return obj
 
-# 默认观察列表 - 优质成长股
-DEFAULT_WATCHLIST = [
+# 默认观察列表 - 美股优质成长股
+DEFAULT_US_WATCHLIST = [
     # 科技巨头
     "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "AVGO",
     # 软件/SaaS
@@ -64,8 +75,40 @@ DEFAULT_WATCHLIST = [
     "COIN", "HOOD", "SQ", "PYPL", "SOFI",
     # 新兴市场/高成长
     "PLTR", "MSTR", "APP", "DUOL", "CELH", "ELF", "SMCI",
-    # 中国科技股
+    # 中国科技股 (ADR)
     "BABA", "PDD", "JD", "BIDU", "NIO", "XPEV", "LI"
+]
+
+# A股默认观察列表 - 优质成长股
+DEFAULT_CN_WATCHLIST = [
+    # 白酒/消费
+    "600519",   # 贵州茅台
+    "000858",   # 五粮液
+    "600276",   # 恒瑞医药
+    # 新能源
+    "300750",   # 宁德时代
+    "601012",   # 隆基绿能
+    "002594",   # 比亚迪
+    # 科技/半导体
+    "688981",   # 中芯国际
+    "603501",   # 韦尔股份
+    "002371",   # 北方华创
+    "300014",   # 亿纬锂能
+    # 金融
+    "600036",   # 招商银行
+    "000001",   # 平安银行
+    # 互联网/AI
+    "603019",   # 中科曙光
+    "002230",   # 科大讯飞
+    "300033",   # 同花顺
+    "600570",   # 恒生电子
+    # 制造业
+    "000333",   # 美的集团
+    "000651",   # 格力电器
+    "002415",   # 海康威视
+    # 医药
+    "300760",   # 迈瑞医疗
+    "600809",   # 山西汾酒
 ]
 
 
@@ -138,13 +181,59 @@ def calculate_rsi(prices: pd.Series, period: int = 14) -> Optional[float]:
 
 
 def get_stock_data(ticker: str, period: str = "1y") -> Tuple[Optional[yf.Ticker], Optional[pd.DataFrame]]:
-    """获取股票基础数据"""
+    """获取美股数据 (yfinance)"""
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period=period)
         if hist.empty or len(hist) < 50:
             return None, None
         return stock, hist
+    except Exception as e:
+        return None, None
+
+
+def get_cn_stock_data(code: str) -> Tuple[Optional[Dict], Optional[pd.DataFrame]]:
+    """获取A股数据 (akshare)
+
+    Returns:
+        info: 股票基本信息 dict
+        hist: 历史行情 DataFrame (列名兼容 yfinance: Open, High, Low, Close, Volume)
+    """
+    if not AKSHARE_AVAILABLE:
+        print("⚠️  akshare 未安装，无法获取A股数据")
+        return None, None
+
+    try:
+        # 获取历史行情
+        df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20240101", adjust="qfq")
+        if df is None or len(df) < 50:
+            return None, None
+
+        # 列名转换为 yfinance 格式以便兼容
+        df = df.rename(columns={
+            '日期': 'Date',
+            '开盘': 'Open',
+            '收盘': 'Close',
+            '最高': 'High',
+            '最低': 'Low',
+            '成交量': 'Volume'
+        })
+        df['Date'] = pd.to_datetime(df['Date'])
+        df = df.set_index('Date')
+
+        # 获取股票基本信息 - 使用历史数据的最新价格和代码作为名称
+        # 避免使用 stock_zh_a_spot_em() 因为它会加载全市场数据
+        try:
+            current_price = df['Close'].iloc[-1]
+            info = {
+                'shortName': code,  # 使用代码作为名称，避免查询全市场
+                'currentPrice': current_price,
+                'marketCap': 0,
+            }
+        except:
+            info = {'shortName': code, 'currentPrice': 0, 'marketCap': 0}
+
+        return info, df
     except Exception as e:
         return None, None
 
@@ -298,18 +387,18 @@ def analyze_i_institutional(score: CANSLIMScore) -> None:
 
 
 def analyze_stock(ticker: str) -> Optional[CANSLIMScore]:
-    """完整分析一只股票"""
+    """完整分析一只美股"""
     stock, hist = get_stock_data(ticker)
     if not stock or hist is None:
         return None
-    
+
     try:
         info = stock.info
         score = CANSLIMScore(ticker=ticker)
         score.name = info.get('shortName', ticker)
         score.price = info.get('currentPrice', info.get('regularMarketPrice', 0))
         score.market_cap = info.get('marketCap', 0)
-        
+
         # 逐项分析
         analyze_c_current(stock, score)
         analyze_a_annual(stock, score)
@@ -317,37 +406,92 @@ def analyze_stock(ticker: str) -> Optional[CANSLIMScore]:
         analyze_s_supply_demand(hist, score)
         analyze_l_leader(hist, score)
         analyze_i_institutional(score)
-        
+
         # 计算总分
         score.total_score = (
-            score.c_score + score.a_score + score.n_score + 
+            score.c_score + score.a_score + score.n_score +
             score.s_score + score.l_score + score.i_score + score.m_market_score
         )
-        
+
+        return score
+    except Exception as e:
+        return None
+
+
+def analyze_cn_stock(code: str) -> Optional[CANSLIMScore]:
+    """完整分析一只A股 (使用akshare)"""
+    info, hist = get_cn_stock_data(code)
+    if not info or hist is None:
+        return None
+
+    try:
+        score = CANSLIMScore(ticker=code)
+        score.name = info.get('shortName', code)
+        score.price = info.get('currentPrice', 0)
+        # A股市值需要另外获取，暂时设为0
+        score.market_cap = info.get('marketCap', 0)
+
+        # A股目前主要支持技术分析 (N, S, L)
+        # C和A需要财务报表数据，akshare可以扩展
+
+        analyze_n_new_highs(hist, score)
+        analyze_s_supply_demand(hist, score)
+        analyze_l_leader(hist, score)
+        # A股市值数据需要另外获取，暂时跳过I评分
+
+        # 计算总分 (A股目前主要基于技术面)
+        score.total_score = (
+            score.c_score + score.a_score + score.n_score +
+            score.s_score + score.l_score + score.i_score + score.m_market_score
+        )
+
         return score
     except Exception as e:
         return None
 
 
 def check_market_direction() -> Tuple[bool, float]:
-    """检查市场方向 (SPY vs 50日均线)"""
+    """检查美股市场方向 (SPY vs 50日均线)"""
     try:
         spy = yf.Ticker("SPY")
         hist = spy.history(period="6mo")
         if len(hist) < 50:
             return False, 0
-        
+
         current = hist['Close'].iloc[-1]
         sma50 = hist['Close'].rolling(50).mean().iloc[-1]
         sma200 = hist['Close'].rolling(200).mean().iloc[-1] if len(hist) >= 200 else None
-        
+
         distance_pct = (current / sma50 - 1) * 100
-        
+
         # 价格在50日线上方视为趋势良好
         is_uptrend = current > sma50
         if sma200:
             is_uptrend = is_uptrend and (current > sma200)
-        
+
+        return is_uptrend, round(distance_pct, 2)
+    except:
+        return False, 0
+
+
+def check_cn_market_direction() -> Tuple[bool, float]:
+    """检查A股市场方向 (上证指数 vs 50日均线)"""
+    if not AKSHARE_AVAILABLE:
+        return False, 0
+
+    try:
+        # 获取上证指数历史数据
+        df = ak.index_zh_a_hist(symbol="000001", period="daily", start_date="20240801")
+        if df is None or len(df) < 50:
+            return False, 0
+
+        df = df.rename(columns={'收盘': 'Close'})
+        current = df['Close'].iloc[-1]
+        sma50 = df['Close'].rolling(50).mean().iloc[-1]
+
+        distance_pct = (current / sma50 - 1) * 100
+        is_uptrend = current > sma50
+
         return is_uptrend, round(distance_pct, 2)
     except:
         return False, 0
@@ -445,6 +589,11 @@ def main():
   L (Leader)     : RSI>50(+10), 站50日线上(+10), 站200日线上(+5)
   I (Institutional): 市值10B-100B(+15), >100B(+10)
   M (Market)     : 市场趋势加成(0-10)
+
+市场选择:
+  us   - 美股 (yfinance, 默认)
+  cn   - A股 (akshare)
+  all  - 美股+A股
         """
     )
     parser.add_argument('--watchlist', nargs='+', help='指定股票列表')
@@ -452,31 +601,56 @@ def main():
     parser.add_argument('--min-score', type=int, default=25, help='最低得分门槛 (默认25)')
     parser.add_argument('--output', choices=['text', 'json'], default='text', help='输出格式')
     parser.add_argument('--export', type=str, help='导出JSON文件路径')
-    
+    parser.add_argument('--market', choices=['us', 'cn', 'all'], default='us', help='市场选择 (默认us)')
+
     args = parser.parse_args()
-    
-    watchlist = args.watchlist if args.watchlist else DEFAULT_WATCHLIST
-    
+
+    # 根据市场选择设置观察列表
+    if args.market == 'cn':
+        watchlist = args.watchlist if args.watchlist else DEFAULT_CN_WATCHLIST
+        is_cn_market = True
+        market_name = "A股"
+    elif args.market == 'all':
+        watchlist = (args.watchlist if args.watchlist else DEFAULT_US_WATCHLIST) + DEFAULT_CN_WATCHLIST
+        is_cn_market = False
+        market_name = "美股+A股"
+    else:
+        watchlist = args.watchlist if args.watchlist else DEFAULT_US_WATCHLIST
+        is_cn_market = False
+        market_name = "美股"
+
     print("=" * 90)
-    print("🦐 CAN SLIM 成长股量化筛选器 v1.0")
+    print(f"🦐 CAN SLIM 成长股量化筛选器 v1.1 - {market_name}")
     print("   基于威廉·欧奈尔(William J. O'Neil)投资策略")
     print("=" * 90)
-    
+
     # 检查市场方向
-    market_ok, market_pct = check_market_direction()
+    if args.market == 'cn':
+        market_ok, market_pct = check_cn_market_direction()
+        market_label = "上证指数"
+    else:
+        market_ok, market_pct = check_market_direction()
+        market_label = "SPY"
+
     market_status = "✅ 上升趋势" if market_ok else "⚠️ 震荡/下降"
-    print(f"\n📈 市场方向 (SPY): {market_status} ({market_pct:+.1f}% vs 50日均线)")
-    
+    print(f"\n📈 市场方向 ({market_label}): {market_status} ({market_pct:+.1f}% vs 50日均线)")
+
     if not market_ok:
         print("   ⚠️  建议: 市场趋势不佳，谨慎操作或降低仓位")
-    
+
     print(f"\n🔍 正在分析 {len(watchlist)} 只股票...")
     print("-" * 90)
-    
+
     results = []
     for i, ticker in enumerate(watchlist, 1):
         print(f"[{i:2d}/{len(watchlist)}] {ticker:6s} ... ", end='', flush=True)
-        score = analyze_stock(ticker)
+
+        # 根据股票代码判断市场并使用对应分析函数
+        if args.market == 'cn' or (args.market == 'all' and ticker.isdigit()):
+            score = analyze_cn_stock(ticker)
+        else:
+            score = analyze_stock(ticker)
+
         if score:
             # 根据市场趋势调整M分
             if market_ok:
