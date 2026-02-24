@@ -347,48 +347,111 @@ def get_cn_stock_data(code: str) -> Tuple[Optional[Dict], Optional[pd.DataFrame]
         return None, None
 
 
+import time
+
+# yfinance 数据缓存
+_yf_financial_cache = {}
+
+def _get_with_retry(func, max_retries=3, delay=1):
+    """带重试的数据获取"""
+    for attempt in range(max_retries):
+        try:
+            result = func()
+            if result is not None and not (hasattr(result, 'empty') and result.empty):
+                return result
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+        except Exception as e:
+            if attempt < max_retries - 1:
+                time.sleep(delay)
+    return None
+
 def analyze_c_current(stock: yf.Ticker, score: CANSLIMScore, ticker: str = "") -> None:
-    """分析C - Current Quarterly Earnings/Revenue"""
-    try:
-        # 尝试获取季度收入数据
-        quarterly_income = stock.quarterly_income_stmt
-        if quarterly_income is not None and not quarterly_income.empty:
-            if 'TotalRevenue' in quarterly_income.index:
-                revenue = quarterly_income.loc['TotalRevenue'].dropna()
-                if len(revenue) >= 4:
+    """分析C - Current Quarterly Earnings/Revenue - 增强版带重试和兜底"""
+    cache_key = f"c_data_{ticker}"
+    
+    # 尝试1: 季度财报数据 (quarterly_income_stmt)
+    quarterly_income = _get_with_retry(lambda: stock.quarterly_income_stmt)
+    
+    if quarterly_income is not None and not quarterly_income.empty:
+        # 收入同比增长
+        # 尝试 TotalRevenue 或 Total Revenue (yfinance 版本差异)
+        revenue_row = None
+        if 'TotalRevenue' in quarterly_income.index:
+            revenue_row = 'TotalRevenue'
+        elif 'Total Revenue' in quarterly_income.index:
+            revenue_row = 'Total Revenue'
+        
+        if revenue_row:
+            revenue = quarterly_income.loc[revenue_row].dropna()
+            if len(revenue) >= 4:
+                recent = revenue.iloc[0]
+                year_ago = revenue.iloc[3]
+                if year_ago != 0 and not pd.isna(year_ago) and year_ago != recent:
+                    growth = ((recent - year_ago) / abs(year_ago)) * 100
+                    score.c_revenue_growth = round(growth, 2)
+                    
+                    # 评分: >25% (+25), >15% (+15), >0% (+5)
+                    if growth > 25:
+                        score.c_score = 25
+                        score.passed_criteria.append("C+")
+                    elif growth > 15:
+                        score.c_score = 15
+                        score.passed_criteria.append("C")
+                    elif growth > 0:
+                        score.c_score = 5
+        
+        # EPS/净利润增长 (处理字段名差异)
+        netincome_row = None
+        if 'NetIncome' in quarterly_income.index:
+            netincome_row = 'NetIncome'
+        elif 'Net Income' in quarterly_income.index:
+            netincome_row = 'Net Income'
+        
+        if netincome_row:
+            net_income = quarterly_income.loc[netincome_row].dropna()
+            if len(net_income) >= 4:
+                recent = net_income.iloc[0]
+                year_ago = net_income.iloc[3]
+                if year_ago != 0 and not pd.isna(year_ago) and year_ago != recent:
+                    growth = ((recent - year_ago) / abs(year_ago)) * 100
+                    score.c_earnings_growth = round(growth, 2)
+    
+    # 尝试2: 使用年度财报兜底 (income_stmt)
+    if score.c_revenue_growth is None:
+        annual_income = _get_with_retry(lambda: stock.income_stmt)
+        if annual_income is not None and not annual_income.empty:
+            if 'TotalRevenue' in annual_income.index:
+                revenue = annual_income.loc['TotalRevenue'].dropna()
+                if len(revenue) >= 2:
                     recent = revenue.iloc[0]
-                    year_ago = revenue.iloc[3]
-                    if year_ago != 0 and not pd.isna(year_ago):
+                    year_ago = revenue.iloc[1]
+                    if year_ago != 0 and not pd.isna(year_ago) and year_ago != recent:
                         growth = ((recent - year_ago) / abs(year_ago)) * 100
                         score.c_revenue_growth = round(growth, 2)
-                        
-                        # 评分: >25% (+25), >15% (+15), >0% (+5)
-                        if growth > 25:
-                            score.c_score = 25
-                            score.passed_criteria.append("C+")
-                        elif growth > 15:
+                        # 年度增长要求更高: >20%算优秀
+                        if growth > 20 and score.c_score < 15:
                             score.c_score = 15
-                            score.passed_criteria.append("C")
-                        elif growth > 0:
-                            score.c_score = 5
-            
-            # 尝试获取EPS增长
-            if 'NetIncome' in quarterly_income.index:
-                net_income = quarterly_income.loc['NetIncome'].dropna()
-                if len(net_income) >= 4:
-                    recent = net_income.iloc[0]
-                    year_ago = net_income.iloc[3]
-                    if year_ago != 0 and not pd.isna(year_ago):
-                        growth = ((recent - year_ago) / abs(year_ago)) * 100
-                        score.c_earnings_growth = round(growth, 2)
-    except:
-        pass
+                            if "C" not in score.passed_criteria:
+                                score.passed_criteria.append("C")
     
-    # 使用 Alpha Vantage 补充数据
+    # 尝试3: 使用 info 中的 revenueGrowth (TTM估算)
+    if score.c_revenue_growth is None:
+        try:
+            info = stock.info
+            if info:
+                revenue_growth = info.get('revenueGrowth')
+                if revenue_growth and not pd.isna(revenue_growth):
+                    score.c_revenue_growth = round(revenue_growth * 100, 2)
+                    if score.c_revenue_growth > 20 and score.c_score < 10:
+                        score.c_score = 10
+        except:
+            pass
+    
+    # 尝试4: Alpha Vantage 补充
     if ticker and ALPHAVANTAGE_AVAILABLE:
         av_fund = get_av_fundamentals(ticker)
         if av_fund:
-            # Alpha Vantage 提供季度增长数据
             if not score.c_revenue_growth and av_fund.get('revenue_growth'):
                 score.c_revenue_growth = av_fund['revenue_growth']
                 if score.c_revenue_growth > 25:
@@ -481,15 +544,89 @@ def analyze_s_supply_demand(hist: pd.DataFrame, score: CANSLIMScore) -> None:
         pass
 
 
-def analyze_l_leader(hist: pd.DataFrame, score: CANSLIMScore) -> None:
-    """分析L - Leader (RSI, Trend)"""
+def calculate_rs_rating(ticker: str, period: str = "252d") -> float:
+    """
+    计算 Relative Strength Rating (相对强度排名)
+    
+    原著定义：股票相对于市场（S&P500）的价格表现排名
+    - 取过去52周价格变化
+    - 与所有股票对比，计算百分位排名
+    - IBD标准：RS > 80 为优秀（前20%）
+    
+    这里简化为：与S&P500对比
+    """
+    try:
+        stock = yf.Ticker(ticker)
+        stock_hist = stock.history(period=period)
+        
+        if stock_hist.empty or len(stock_hist) < 50:
+            return 0.0
+        
+        # 计算股票52周收益率
+        stock_return = (stock_hist['Close'].iloc[-1] / stock_hist['Close'].iloc[0] - 1) * 100
+        
+        # 获取 S&P500 同期收益作为基准
+        spy = yf.Ticker("SPY")
+        spy_hist = spy.history(period=period)
+        spy_return = (spy_hist['Close'].iloc[-1] / spy_hist['Close'].iloc[0] - 1) * 100
+        
+        # 计算相对强度 (股票收益 - 市场收益)
+        relative_strength = stock_return - spy_return
+        
+        # 转换为 0-100 的评分
+        # 相对强度 > 20% → 100分
+        # 相对强度 = 0% → 50分  
+        # 相对强度 < -20% → 0分
+        if relative_strength >= 20:
+            rs_score = 100
+        elif relative_strength <= -20:
+            rs_score = 0
+        else:
+            rs_score = 50 + (relative_strength / 20) * 50
+        
+        return max(0, min(100, rs_score))
+        
+    except Exception as e:
+        print(f"Error calculating RS for {ticker}: {e}")
+        return 0.0
+
+
+def analyze_l_leader(hist: pd.DataFrame, score: CANSLIMScore, ticker: str = "") -> None:
+    """
+    分析L - Leader 行业龙头评分 (满分10分)
+    
+    原著标准：
+    1. RS Rating > 80 (股票表现优于80%的股票) - 6分
+    2. 行业排名靠前 - 2分  
+    3. 市值在行业中处于前25% - 2分
+    """
     try:
         current_price = hist['Close'].iloc[-1]
         
-        # RSI
-        score.l_rsi = calculate_rsi(hist['Close'])
+        # 1. RS Rating 评分 (0-6分)
+        if ticker:
+            rs_rating = calculate_rs_rating(ticker)
+            score.l_rsi = rs_rating  # 复用字段存储RS Rating
+            if rs_rating >= 90:
+                score.l_score += 6
+            elif rs_rating >= 80:
+                score.l_score += 5
+            elif rs_rating >= 70:
+                score.l_score += 3
+            elif rs_rating >= 50:
+                score.l_score += 1
         
-        # 50日/200日均线
+        # 2. 价格接近52周新高 (0-2分)
+        high_52w = hist['High'].max()
+        if high_52w > 0:
+            distance_from_high = (high_52w - current_price) / high_52w * 100
+            
+            if distance_from_high <= 5:  # 距离新高5%以内
+                score.l_score += 2
+            elif distance_from_high <= 10:  # 距离新高10%以内
+                score.l_score += 1
+        
+        # 3. 50日/200日均线趋势判断
         sma50 = hist['Close'].rolling(50).mean().iloc[-1]
         sma200 = hist['Close'].rolling(200).mean().iloc[-1] if len(hist) >= 200 else None
         
@@ -497,33 +634,82 @@ def analyze_l_leader(hist: pd.DataFrame, score: CANSLIMScore) -> None:
         if sma200:
             score.l_above_sma200 = current_price > sma200
         
-        # 评分
-        if score.l_rsi and score.l_rsi > 50:
-            score.l_score += 10
+        # 趋势确认加分
         if score.l_above_sma50:
-            score.l_score += 10
             score.passed_criteria.append("L50")
         if score.l_above_sma200:
-            score.l_score += 5
             score.passed_criteria.append("L200")
+            
     except:
         pass
 
 
-def analyze_i_institutional(score: CANSLIMScore) -> None:
-    """分析I - Institutional Sponsorship (机构持仓)"""
-    # 简化为市值指标
-    cap_b = score.market_cap / 1e9
-    score.i_market_cap_billions = round(cap_b, 2)
+def analyze_i_institutional(stock: yf.Ticker, hist: pd.DataFrame, score: CANSLIMScore) -> None:
+    """
+    分析I - Institutional 机构持股评分 (满分15分)
     
-    # 偏好中大型成长股
-    if cap_b > 100:  # 大型股
-        score.i_score = 10
-    elif cap_b > 10:  # 中型股
-        score.i_score = 15
-        score.passed_criteria.append("I")
-    elif cap_b > 1:  # 小型股
-        score.i_score = 5
+    原著标准：
+    1. 有机构持股（至少几家优质机构）- 5分
+    2. 机构持股比例适中（10%-50%）- 5分
+    3. 近期机构增持趋势 - 5分
+    
+    注意：由于yfinance免费版不提供详细机构持股数据，
+    这里使用简化方案，基于市值和交易量推测机构参与度
+    """
+    try:
+        info = stock.info
+        cap_b = score.market_cap / 1e9
+        score.i_market_cap_billions = round(cap_b, 2)
+        
+        # 1. 市值规模评分 (0-5分)
+        # 原著：机构偏好有一定规模的成熟公司
+        market_cap = info.get('marketCap', 0)
+        if market_cap >= 100e9:  # 大盘股 >100B
+            score.i_score += 5
+        elif market_cap >= 10e9:  # 中盘股 10B-100B
+            score.i_score += 4
+        elif market_cap >= 2e9:  # 小盘股 2B-10B
+            score.i_score += 3
+        elif market_cap >= 500e6:  # 微盘股 500M-2B
+            score.i_score += 2
+        elif market_cap > 0:
+            score.i_score += 1
+        
+        # 2. 日均交易量评分 (0-5分) - 反映机构参与度
+        if not hist.empty and len(hist) >= 20:
+            avg_volume = hist['Volume'].tail(20).mean()
+            if avg_volume >= 10e6:  # 日均1000万股
+                score.i_score += 5
+            elif avg_volume >= 5e6:  # 日均500万股
+                score.i_score += 4
+            elif avg_volume >= 1e6:  # 日均100万股
+                score.i_score += 3
+            elif avg_volume >= 500e3:  # 日均50万股
+                score.i_score += 2
+            elif avg_volume > 0:
+                score.i_score += 1
+        
+        # 3. 价格波动性评分 (0-5分) - 机构偏好稳定增长
+        # 计算过去3个月的价格趋势稳定性
+        if len(hist) >= 63:  # 约3个月
+            recent_returns = hist['Close'].tail(63).pct_change().dropna()
+            if len(recent_returns) > 0:
+                volatility = recent_returns.std() * np.sqrt(252) * 100  # 年化波动率
+                
+                if 15 <= volatility <= 40:  # 适中波动，机构喜欢的区间
+                    score.i_score += 5
+                elif 10 <= volatility < 15 or 40 < volatility <= 50:
+                    score.i_score += 3
+                elif volatility < 10 or 50 < volatility <= 60:
+                    score.i_score += 1
+                # 极高波动 (妖股) 不加分
+        
+        # 标记通过I维度
+        if score.i_score >= 10:
+            score.passed_criteria.append("I")
+            
+    except Exception as e:
+        pass
 
 
 def analyze_stock(ticker: str) -> Optional[CANSLIMScore]:
@@ -544,8 +730,8 @@ def analyze_stock(ticker: str) -> Optional[CANSLIMScore]:
         analyze_a_annual(stock, score, ticker)
         analyze_n_new_highs(hist, score)
         analyze_s_supply_demand(hist, score)
-        analyze_l_leader(hist, score)
-        analyze_i_institutional(score)
+        analyze_l_leader(hist, score, ticker)
+        analyze_i_institutional(stock, hist, score)
 
         # 计算总分
         score.total_score = (
@@ -702,8 +888,8 @@ def print_detailed_analysis(results: List[CANSLIMScore], top_n: int = 5) -> None
         
         # L
         if r.l_rsi:
-            status = "✅" if r.l_rsi > 50 else "🟡"
-            print(f"   💪 RSI: {r.l_rsi:.1f} {status}")
+            status = "✅" if r.l_rsi >= 80 else ("🟡" if r.l_rsi >= 50 else "❌")
+            print(f"   💪 RS Rating: {r.l_rsi:.0f} {status}")
         trend_status = "✅" if r.l_above_sma50 else "❌"
         print(f"   📈 50日均线: {'上方' if r.l_above_sma50 else '下方'} {trend_status}")
 
@@ -726,8 +912,8 @@ def main():
   A (Annual)     : ROE>17%(+15)
   N (New Highs)  : 距52周高<10%(+20), <20%(+10)
   S (Supply/Demand): 成交量>1.5x(+15), >1.2x(+10)
-  L (Leader)     : RSI>50(+10), 站50日线上(+10), 站200日线上(+5)
-  I (Institutional): 市值10B-100B(+15), >100B(+10)
+  L (Leader)     : RS Rating>=90(+6), >=80(+5), 距新高<5%(+2)
+  I (Institutional): 市值+交易量+波动率综合评分(满分15)
   M (Market)     : 市场趋势加成(0-10)
 
 市场选择:
