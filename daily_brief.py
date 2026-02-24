@@ -103,12 +103,13 @@ def get_market_trend() -> dict:
 
 
 def get_canslim_stocks() -> list:
-    """获取 CANSLIM 选股结果"""
+    """获取 CANSLIM 选股结果 (使用内存优化版)"""
     # 先导出到临时文件，避免 stdout 被日志污染
     temp_file = "/tmp/canslim_output.json"
     
+    # 使用优化版 scanner: 分批处理 + 减少内存占用
     stdout, stderr, rc = run_command(
-        f"uv run canslim_scanner.py --top 5 --output json --export {temp_file}",
+        f"uv run canslim_scanner_optimized.py --top 5 --batch-size 8 --output json --export {temp_file}",
         cwd=WORKSPACE
     )
     

@@ -1,0 +1,49 @@
+name: CAN SLIM Daily Scan
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  workflow_dispatch:
+
+env:
+  PYTHON_VERSION: '3.10'
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ env.PYTHON_VERSION }}
+        
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install yfinance pandas numpy requests matplotlib
+    
+    - name: Run CAN SLIM Scanner
+      id: scanner
+      timeout-minutes: 30
+      run: |
+        mkdir -p reports
+        python canslim_scanner.py --top 100 --output reports/scan_$(date +%Y%m%d_%H%M%S).json || echo "Scan completed with warnings"
+      continue-on-error: true
+      
+    - name: Send to Discord
+      if: success()
+      env:
+        DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      run: |
+        if [ -n "$DISCORD_WEBHOOK" ]; then
+          curl -H "Content-Type: application/json" \
+               -X POST \
+               -d "{\"content\": \"📊 CAN SLIM 每日扫描完成 - $(date +%Y-%m-%d %H:%M)\\n查看详细报告: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+               "$DISCORD_WEBHOOK" || echo "Discord webhook failed"
+        else
+          echo "DISCORD_WEBHOOK_URL not configured"
+        fi
