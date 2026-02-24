@@ -24,23 +24,95 @@ import argparse
 import pickle
 import os
 import sqlite3
+import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from dataclasses import dataclass, asdict
 from functools import wraps
 from pathlib import Path
 
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('canslim_scanner.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 try:
     import akshare as ak
     AKSHARE_AVAILABLE = True
+    logger.info("akshare 模块加载成功")
 except ImportError:
     AKSHARE_AVAILABLE = False
+    logger.warning("akshare 模块未安装，A股功能将不可用")
 
 import time
 import requests
 
 ALPHA_VANTAGE_API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY", "")
 ALPHAVANTAGE_AVAILABLE = bool(ALPHA_VANTAGE_API_KEY)
+if ALPHAVANTAGE_AVAILABLE:
+    logger.info("Alpha Vantage API 已配置")
+else:
+    logger.info("Alpha Vantage API 未配置，将使用 yfinance 作为主要数据源")
+
+
+# ============================================================================
+# 数据源健康状态跟踪
+# ============================================================================
+
+class DataSourceHealth:
+    """数据源健康状态跟踪器"""
+    def __init__(self):
+        self.yfinance_failures = 0
+        self.akshare_failures = 0
+        self.alphavantage_failures = 0
+        self.last_success = {}
+    
+    def record_failure(self, source):
+        if source == 'yfinance':
+            self.yfinance_failures += 1
+            logger.warning(f"yfinance 数据源失败次数: {self.yfinance_failures}")
+        elif source == 'akshare':
+            self.akshare_failures += 1
+            logger.warning(f"akshare 数据源失败次数: {self.akshare_failures}")
+        elif source == 'alphavantage':
+            self.alphavantage_failures += 1
+            logger.warning(f"Alpha Vantage 数据源失败次数: {self.alphavantage_failures}")
+    
+    def record_success(self, source):
+        self.last_success[source] = time.time()
+        logger.debug(f"{source} 数据源成功")
+    
+    def is_healthy(self, source):
+        """5分钟内无成功则视为不健康"""
+        last = self.last_success.get(source, 0)
+        return time.time() - last < 300
+
+
+# 全局健康状态实例
+health = DataSourceHealth()
+
+
+def print_health_report(health):
+    """打印数据源健康报告"""
+    print("\n" + "="*50)
+    print("📊 数据源健康报告")
+    print("="*50)
+    for source in ['yfinance', 'akshare', 'alphavantage']:
+        status = "✅ 健康" if health.is_healthy(source) else "❌ 异常"
+        if source == 'yfinance':
+            failures = health.yfinance_failures
+        elif source == 'akshare':
+            failures = health.akshare_failures
+        else:
+            failures = health.alphavantage_failures
+        print(f"  {source}: {status} (失败{failures}次)")
+    print("="*50)
 
 
 # ============================================================================
@@ -72,16 +144,30 @@ def retry_on_failure(max_retries=3, delay=1):
 
 def validate_stock_data(hist, info, ticker):
     """验证数据完整性和合理性"""
+    errors = []
+    
     if hist is None or hist.empty:
-        return False, "无历史数据"
-    if len(hist) < 50:
-        return False, "历史数据不足50天"
+        errors.append(f"{ticker}: 无历史数据")
+    elif len(hist) < 50:
+        errors.append(f"{ticker}: 历史数据不足50天")
+    
     if info is None:
-        return False, "无基本信息"
-    current_price = hist['Close'].iloc[-1]
-    if current_price <= 0 or pd.isna(current_price):
-        return False, "价格数据异常"
-    return True, "数据正常"
+        errors.append(f"{ticker}: 无基本信息")
+    
+    if hist is not None and not hist.empty:
+        try:
+            current_price = hist['Close'].iloc[-1]
+            if current_price <= 0 or pd.isna(current_price):
+                errors.append(f"{ticker}: 价格数据异常")
+            if current_price > 100000:  # 异常高价
+                errors.append(f"{ticker}: 价格异常高，可能数据错误")
+        except Exception as e:
+            errors.append(f"{ticker}: 价格数据读取失败 - {e}")
+    
+    is_valid = len(errors) == 0
+    if not is_valid:
+        logger.warning(f"数据验证失败: {errors}")
+    return is_valid, errors
 
 
 # ============================================================================
@@ -238,45 +324,68 @@ def get_av_fundamentals(symbol: str) -> Optional[Dict]:
 
 @retry_on_failure(max_retries=3, delay=1)
 def get_stock_data_yf(ticker: str, period: str = "1y"):
+    logger.info(f"{ticker}: 尝试从 yfinance 获取数据")
     stock = yf.Ticker(ticker)
     hist = stock.history(period=period)
     if hist.empty or len(hist) < 50:
+        logger.warning(f"{ticker}: yfinance 返回数据不足")
         return None, None
+    logger.info(f"{ticker}: yfinance 数据获取成功")
     return stock, hist
 
 def get_stock_data(ticker: str, period: str = "1y", use_cache: bool = True):
     global _data_cache
+    # 尝试缓存
     if use_cache:
         cached_info, cached_hist = _data_cache.get(ticker, market="us")
         if cached_info is not None and cached_hist is not None:
-            is_valid, msg = validate_stock_data(cached_hist, cached_info, ticker)
+            is_valid, errors = validate_stock_data(cached_hist, cached_info, ticker)
             if is_valid:
+                logger.info(f"{ticker}: 使用缓存数据")
                 return cached_info, cached_hist, "cache"
+    
+    # 尝试 yfinance
     stock, hist = get_stock_data_yf(ticker, period)
     if stock is not None and hist is not None:
-        is_valid, msg = validate_stock_data(hist, stock.info, ticker)
+        is_valid, errors = validate_stock_data(hist, stock.info, ticker)
         if is_valid:
+            health.record_success('yfinance')
             if use_cache:
                 _data_cache.set(ticker, stock.info, hist, market="us")
             return stock, hist, "yfinance"
+        else:
+            logger.warning(f"{ticker}: yfinance 数据验证失败 - {errors}")
+            health.record_failure('yfinance')
+    else:
+        health.record_failure('yfinance')
+    
+    # 尝试 Alpha Vantage 作为备用
     if ALPHAVANTAGE_AVAILABLE:
+        logger.info(f"{ticker}: 尝试 Alpha Vantage 备用源")
         av_hist = get_av_daily(ticker)
         if av_hist is not None and len(av_hist) >= 50:
             av_info = get_av_fundamentals(ticker)
             if av_info:
-                is_valid, msg = validate_stock_data(av_hist, av_info, ticker)
+                is_valid, errors = validate_stock_data(av_hist, av_info, ticker)
                 if is_valid:
+                    health.record_success('alphavantage')
                     if use_cache:
                         _data_cache.set(ticker, av_info, av_hist, market="us")
                     return av_info, av_hist, "alphavantage"
+        health.record_failure('alphavantage')
+    
+    logger.error(f"{ticker}: 所有数据源均失败")
     return None, None, "failed"
 
 @retry_on_failure(max_retries=3, delay=1)
 def get_cn_stock_data_akshare(code: str):
     if not AKSHARE_AVAILABLE:
+        logger.warning("akshare 未安装，无法获取A股数据")
         return None, None
+    logger.info(f"{code}: 尝试从 akshare 获取数据")
     df = ak.stock_zh_a_hist(symbol=code, period="daily", start_date="20240101", adjust="qfq")
     if df is None or len(df) < 50:
+        logger.warning(f"{code}: akshare 返回数据不足")
         return None, None
     df = df.rename(columns={'日期': 'Date', '开盘': 'Open', '收盘': 'Close', '最高': 'High', '最低': 'Low', '成交量': 'Volume'})
     df['Date'] = pd.to_datetime(df['Date'])
@@ -284,25 +393,39 @@ def get_cn_stock_data_akshare(code: str):
     try:
         current_price = df['Close'].iloc[-1]
         info = {'shortName': code, 'currentPrice': current_price, 'marketCap': 0}
-    except:
+    except Exception as e:
+        logger.warning(f"{code}: 无法获取当前价格 - {e}")
         info = {'shortName': code, 'currentPrice': 0, 'marketCap': 0}
+    logger.info(f"{code}: akshare 数据获取成功")
     return info, df
 
 def get_cn_stock_data(code: str, use_cache: bool = True):
     global _data_cache
+    # 尝试缓存
     if use_cache:
         cached_info, cached_hist = _data_cache.get(code, market="cn")
         if cached_info is not None and cached_hist is not None:
-            is_valid, msg = validate_stock_data(cached_hist, cached_info, code)
+            is_valid, errors = validate_stock_data(cached_hist, cached_info, code)
             if is_valid:
+                logger.info(f"{code}: 使用缓存数据")
                 return cached_info, cached_hist, "cache"
+    
+    # 尝试 akshare
     info, hist = get_cn_stock_data_akshare(code)
     if info is not None and hist is not None:
-        is_valid, msg = validate_stock_data(hist, info, code)
+        is_valid, errors = validate_stock_data(hist, info, code)
         if is_valid:
+            health.record_success('akshare')
             if use_cache:
                 _data_cache.set(code, info, hist, market="cn")
             return info, hist, "akshare"
+        else:
+            logger.warning(f"{code}: akshare 数据验证失败 - {errors}")
+            health.record_failure('akshare')
+    else:
+        health.record_failure('akshare')
+    
+    logger.error(f"{code}: A股所有数据源均失败")
     return None, None, "failed"
 
 
@@ -805,6 +928,9 @@ def main():
     
     if args.export:
         export_to_json(results, args.export)
+    
+    # 打印数据源健康报告
+    print_health_report(health)
     
     print("\n" + "=" * 90)
     print("⚠️ 免责声明: 本工具仅供学习研究，不构成投资建议")
