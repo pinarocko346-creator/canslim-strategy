@@ -29,13 +29,14 @@ jobs:
       - name: Run CAN SLIM Scanner
         id: scanner
         timeout-minutes: 30
+        continue-on-error: true
         run: |
           mkdir -p reports
-          python canslim_scanner.py --top 20 --min-score 25 --export reports/canslim_$(date +%Y%m%d).json 2>&1 | tee reports/scan_$(date +%Y%m%d).log || echo "Scan completed"
-        continue-on-error: true
+          python canslim_scanner.py --top 20 --min-score 25 --export reports/canslim_$(date +%Y%m%d).json > reports/scan_$(date +%Y%m%d).log 2>&1 || echo "Scan completed"
 
       - name: Generate CSV from JSON
         id: csvgen
+        continue-on-error: true
         run: |
           python3 << 'EOF'
           import json
@@ -82,7 +83,6 @@ jobs:
 
           print("Summary generated")
           EOF
-        continue-on-error: true
 
       - name: Upload Reports
         uses: actions/upload-artifact@v4
