@@ -3,7 +3,7 @@ name: CAN SLIM Daily Scan
 on:
   schedule:
     # 每天北京时间 09:00 (UTC 01:00)
-    - cron: '0 1 * * *'
+    - cron: '0 23 * * *'
   workflow_dispatch:
     inputs:
       stock_count:
