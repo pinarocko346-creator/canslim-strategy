@@ -2,10 +2,9 @@ name: CAN SLIM Daily Scan
 
 on:
   schedule:
-    - cron: '0 1 * * *'
+    - cron: '0 23 * * *'  # 北京时间 07:00
   workflow_dispatch:
-
-env:
+  env:
   PYTHON_VERSION: '3.10'
 
 jobs:
@@ -19,7 +18,7 @@ jobs:
     - name: Set up Python
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ env.PYTHON_VERSION }}
+              python-version: ${{ env.PYTHON_VERSION }}
         
     - name: Install dependencies
       run: |
@@ -31,18 +30,92 @@ jobs:
       timeout-minutes: 30
       run: |
         mkdir -p reports
-        python canslim_scanner.py --top 100 --output reports/scan_$(date +%Y%m%d_%H%M%S).json || echo "Scan completed with warnings"
+        python canslim_scanner.py --top 20 --min-score 25 --export reports/canslim_$(date +%Y%m%d).json 2>&1 | tee reports/scan_$(date +%Y%m%d).log || echo "Scan completed"
       continue-on-error: true
-      
+        - name: Generate CSV from JSON
+      id: csvgen
+      run: |
+        python3 << 'EOF'
+        import json
+        import csv
+        import os
+        from datetime import datetime
+
+        json_file = None
+        for f in os.listdir('reports'):
+            if f.startswith('canslim_') and f.endswith('.json'):
+                json_file = os.path.join('reports', f)
+                break
+                if not json_file or not os.path.exists(json_file):
+            print("No JSON file found")
+            exit(0)
+        
+        with open(json_file, 'r') as f:
+            data = json.load(f)
+        
+        if not data:
+            print("No data in JSON")
+            exit(0)
+        
+        # Generate CSV
+        csv_file = json_file.replace('.json', '.csv')
+        with open(csv_file, 'w', newline='', encoding='utf-8-sig') as f:
+            if data:
+                            writer = csv.DictWriter(f, fieldnames=data[0].keys())
+                writer.writeheader()
+                writer.writerows(data)
+        
+        print(f"CSV generated: {csv_file}")
+        print(f"Stock count: {len(data)}")
+        
+        # Generate summary for Discord
+        summary = []
+        for i, stock in enumerate(data[:10], 1):
+            ticker = stock.get('ticker', 'N/A')
+            score = stock.get('total_score', 0)
+            price = stock.get('price', 0)
+            summary.append(f"{i}. {ticker} ({score}分) ${price:.2f}")
+                with open('reports/summary.txt', 'w') as f:
+            f.write(f"CAN SLIM 选股结果 ({datetime.now().strftime('%Y-%m-%d')})\n")
+            f.write(f"共选出 {len(data)} 只股票\n\n")
+            f.write("Top 10:\n")
+            f.write("\n".join(summary))
+        
+        print("Summary generated")
+        EOF
+      continue-on-error: true
+    
+    - name: Upload Reports
+      uses: actions/upload-artifact@v4
+      with:
+        name: canslim-reports-${{ github.run_id }}
+        path: reports/
+                retention-days: 30
+    
+    - name: Commit Reports
+      if: ${{ success() }}
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add reports/
+        git diff --staged --quiet || (git commit -m "📊 CAN SLIM 每日选股报告 $(date +%Y-%m-%d)" && git push) || echo "No changes"
+    
     - name: Send to Discord
       if: success()
       env:
         DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
       run: |
-        if [ -n "$DISCORD_WEBHOOK" ]; then
+              if [ -n "$DISCORD_WEBHOOK" ]; then
+          SUMMARY=$(cat reports/summary.txt 2>/dev/null || echo "CAN SLIM 选股完成")
+          MSG="📊 CAN SLIM 每日选股完成 - $(date +%Y-%m-%d)
+
+$SUMMARY
+
+📁 查看完整CSV: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
           curl -H "Content-Type: application/json" \
                -X POST \
-               -d "{\"content\": \"📊 CAN SLIM 每日扫描完成 - $(date +%Y-%m-%d %H:%M)\\n查看详细报告: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+               -d "{\"content\": \"$MSG\"}" \
                "$DISCORD_WEBHOOK" || echo "Discord webhook failed"
         else
           echo "DISCORD_WEBHOOK_URL not configured"
